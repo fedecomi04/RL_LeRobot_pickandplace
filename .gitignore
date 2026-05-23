@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Training outputs (not tracked; checkpoints live in final_utils/ only)
+runs/
+old_runs/
+artifacts/
+wandb/
+logs/
+outputs/
+lightning_logs/
+deploy_runs/
+
+# Calibration scratch
+calib_frames_dense/
+calibration_frames/
+
+# Local Claude state
+.claude/
+
+# Temporary
+*.tmp
+*.temp
+*.bak
+**/_wbtmp/

@@ -1,0 +1,36 @@
+name: squint
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    # Core ML
+    - torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+    - torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+    - tensordict==0.8.3
+    - torchrl==0.8.1
+
+    # Environment
+    - mani_skill_nightly
+    - gymnasium
+    # Convex decomposition for the bowl mesh (envs/place.py uses
+    # decomposition="coacd"). Without this, scene load fails with
+    # ModuleNotFoundError inside sapien.wrapper.coacd.
+    - coacd
+
+    # Utilities
+    - numpy
+    - tyro
+    - tqdm
+    - wandb
+    - opencv-python==4.12.0.88
+
+    # FastSAM masking for eval1/2/3 (final_utils.fastsam_seg)
+    - ultralytics
+
+    # Rerun viewer + .rrd recording (eval2/eval3 --save_window)
+    - rerun-sdk
+
+    # Deploy
+    - lerobot[feetech]==0.4.3

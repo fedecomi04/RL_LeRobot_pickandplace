@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Provision a Brev (or any Ubuntu+CUDA) NVIDIA VM for Squint training.
+#
+# Usage (on the VM, after `ssh brev-...`):
+#   export WANDB_API_KEY=...        # required
+#   export HF_TOKEN=...             # optional (HF checkpoint mirror)
+#   export SQUINT_REMOTE=git@github.com:fedecomi04/squint.git   # or https://...
+#   bash brev_setup.sh
+#
+# Idempotent: safe to re-run on the same VM to refresh code or re-login.
+set -euo pipefail
+
+REPO_DIR="${REPO_DIR:-$HOME/squint}"
+SQUINT_REMOTE="${SQUINT_REMOTE:-https://github.com/fedecomi04/squint.git}"
+
+echo "==[1/4] miniforge + base tooling ============================"
+sudo apt-get update -qq
+# libvulkan1 + vulkan-tools: SAPIEN's renderer logs a fallback warning
+# when libvulkan isn't installed system-wide ("Failed to find system
+# libvulkan. Fallback to SAPIEN builtin libvulkan."). Installing the
+# loader silences it and uses the NVIDIA driver's Vulkan ICD instead of
+# the bundled fallback.
+# nvtop intentionally omitted — not in stock Ubuntu repos on every image.
+sudo apt-get install -y -qq \
+    git wget tmux htop ffmpeg \
+    libvulkan1 vulkan-tools
+
+# NVIDIA Vulkan ICD (libGLX_nvidia + nvidia_icd.json). Brev's H100 images
+# ship a HEADLESS NVIDIA driver — compute libs only — and pin `libnvidia-gl*`
+# at priority -1 so apt refuses to install it. Without this lib SAPIEN can't
+# create a Vulkan instance: `vk::createInstanceUnique: ErrorIncompatibleDriver`.
+# On compute-only A100 images this lib is already pre-installed, so the check
+# is a no-op there.
+if ! ls /usr/share/vulkan/icd.d/ 2>/dev/null | grep -q nvidia_icd.json; then
+  DRV="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
+  MAJOR="${DRV%%.*}"
+  if [ -n "$MAJOR" ]; then
+    echo "  (no NVIDIA Vulkan ICD; installing libnvidia-gl-${MAJOR} via pin override)"
+    # If the cuda-keyring isn't present yet, pull the .deb.
+    if ! dpkg -s cuda-keyring >/dev/null 2>&1; then
+      wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb" -O /tmp/cuda-keyring.deb
+      sudo dpkg -i /tmp/cuda-keyring.deb >/dev/null
+      sudo apt-get update -y >/dev/null
+    fi
+    printf 'Package: libnvidia-gl-%s\nPin: version *\nPin-Priority: 1000\n' "$MAJOR" \
+      | sudo tee /etc/apt/preferences.d/zz-nvidia-gl-override > /dev/null
+    sudo apt-get install -y --allow-downgrades "libnvidia-gl-${MAJOR}=${DRV}-1ubuntu1" \
+      || sudo apt-get install -y "libnvidia-gl-${MAJOR}"
+  fi
+fi
+
+if [ ! -d "$HOME/miniforge3" ]; then
+  # NB: not /tmp — many cloud VM images mount /tmp noexec, which breaks
+  # the miniforge self-extractor.
+  INSTALLER="$HOME/miniforge.sh"
+  wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O "$INSTALLER"
+  bash "$INSTALLER" -b -p "$HOME/miniforge3"
+  rm -f "$INSTALLER"
+fi
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+
+echo "==[2/4] clone / update repo =================================="
+if [ ! -d "$REPO_DIR/.git" ]; then
+  git clone "$SQUINT_REMOTE" "$REPO_DIR"
+fi
+cd "$REPO_DIR"
+git pull --ff-only
+
+echo "==[3/4] conda env from environment.yaml ====================="
+if ! conda env list | awk '{print $1}' | grep -qx squint; then
+  conda env create -f environment.yaml
+else
+  echo "  (env 'squint' already exists, skipping create)"
+fi
+conda activate squint
+
+# Belt-and-suspenders: install coacd into already-existing squint envs that
+# were created from an older environment.yaml (before coacd was listed).
+python -c "import coacd" 2>/dev/null || pip install -q coacd
+
+# Blackwell (RTX Pro 6000 / B100 / B200) needs PyTorch built with CUDA 12.8
+# and kernels for sm_100 / sm_120. The stock environment.yaml ships cu126
+# wheels which are Hopper-only — they crash with
+#   "no kernel image is available for execution on the device"
+# on first CUDA op. We detect compute capability >= 10.0 (Blackwell) and
+# swap to torch 2.7.1+cu128 (lerobot-compatible, includes sm_100/sm_120).
+# Avoid `latest` because the cu128 index now serves torch 2.12 which:
+#  (a) breaks lerobot 0.4.3 (requires torch<2.8.0),
+#  (b) is paired with a torchaudio version mismatch on the index.
+NEED_BLACKWELL_TORCH=$(python - <<'PY' 2>/dev/null
+import sys
+try:
+    import torch
+except Exception:
+    print("1"); sys.exit()
+if not torch.cuda.is_available():
+    print("0"); sys.exit()
+cap = torch.cuda.get_device_capability(0)
+arch_list = torch.cuda.get_arch_list()
+# Need swap if GPU is sm_100+ (Blackwell) AND torch wasn't built for it.
+need = cap[0] >= 10
+covered = any(s in arch_list for s in ("sm_100", "sm_120"))
+print("1" if (need and not covered) else "0")
+PY
+)
+if [ "$NEED_BLACKWELL_TORCH" = "1" ]; then
+  echo "  (Blackwell GPU detected, swapping torch to 2.7.1+cu128)"
+  pip uninstall -y -q torch torchvision torchaudio
+  pip install -q --index-url https://download.pytorch.org/whl/cu128 \
+    torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+  python -c "import torch; assert torch.zeros(4, device='cuda').sum().item() == 0.0, 'CUDA op still fails after swap'; print('  Blackwell torch OK:', torch.__version__, torch.cuda.get_arch_list())"
+fi
+
+echo "==[4/4] wandb / HF login ====================================="
+if [ -z "${WANDB_API_KEY:-}" ]; then
+  echo "ERROR: WANDB_API_KEY is required. Get it from https://wandb.ai/authorize" >&2
+  exit 1
+fi
+wandb login --relogin "$WANDB_API_KEY"
+
+if [ -n "${HF_TOKEN:-}" ]; then
+  pip install -q huggingface_hub
+  huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential
+fi
+
+# Sanity-check CUDA + parallel-env build.
+python - <<'PY'
+import torch, importlib
+print("torch", torch.__version__, "cuda:", torch.cuda.is_available(),
+      "device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "-")
+importlib.import_module("mani_skill")
+print("mani_skill: ok")
+PY
+
+echo ""
+echo "==> Setup complete. Next: bash scripts/brev_run_evals.sh"
